@@ -768,6 +768,8 @@ class photometry:
 
         else:
             print("Not def yet")
+
+            
                 
 """
 input_run = {
