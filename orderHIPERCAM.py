@@ -431,18 +431,327 @@ class Photometry:
         self.data = []
         self.entries_to_process = []
 
-    def solvwcs(self):
-        print('x')
+    def solvwcs(self, log_file=None, ccd_label='1', win_label='1',
+                scale_low=0.3, scale_high=1.5,
+                ra_center=None, dec_center=None, radius=5.0,
+                output_csv='wcs_radec.csv', frame_idx=3,
+                astrometry_cache='astrometry_cache'):
+        """
+        Solve WCS from the .ape star catalog produced by setaper(), then
+        transform every aperture (x, y) in the reduce .log to (RA, DEC)
+        for all frames.
+
+        Requires the ``astrometry`` Python package (pip install astrometry).
+
+        Parameters
+        ----------
+        log_file : str, optional
+            Path to reduce .log file. Defaults to ``base_dir/all.log``.
+        ccd_label : str
+            CCD label used in setaper() and reduce().
+        win_label : str
+            Window label (e.g. '1').
+        scale_low, scale_high : float
+            Plate-scale bounds in arcsec/pixel.
+        ra_center, dec_center : float, optional
+            Field-centre hint in degrees (speeds up solve considerably).
+        radius : float
+            Search radius in degrees when a centre hint is given.
+        output_csv : str
+            Output CSV filename saved inside ``base_dir``.
+        frame_idx : int
+            Index into the HCM file list used as the reference frame.
+            Should match the frame used by setaper() so the .ape file
+            is consistent.
+        astrometry_cache : str
+            Directory where astrometry.net index files are cached.
+
+        Returns
+        -------
+        pandas.DataFrame or None
+            Columns: frame, mjd, aperture, x_log, y_log, x_pix, y_pix,
+            ra_deg, dec_deg.
+        """
+        import astrometry
+        import pandas as pd
+
+        # ── 1. Collect HCM file list ──────────────────────────────────
+        hcm_files = []
+        for lis_path in self.lis:
+            if os.path.exists(lis_path):
+                with open(lis_path) as fh:
+                    hcm_files.extend(l.strip() for l in fh if l.strip())
+        if not hcm_files:
+            print(f"{RED}[solvwcs] No HCM files found in list files.{RESET}")
+            return None
+
+        ref_idx = min(frame_idx, len(hcm_files) - 1)
+        ref_hcm = hcm_files[ref_idx]
+        print(f"{BLUE}[solvwcs] Reference frame [{ref_idx}]: "
+              f"{os.path.basename(ref_hcm)}{RESET}")
+
+        # ── 2. Get binning from reference window ──────────────────────
+        try:
+            mccd = hcam.MCCD.read(ref_hcm)
+            window = mccd[ccd_label][win_label]
+            xbin = int(getattr(window, 'xbin', 1))
+            ybin = int(getattr(window, 'ybin', 1))
+        except Exception as e:
+            print(f"{RED}[solvwcs] Cannot read reference frame: {e}{RESET}")
+            return None
+
+        # ── 3. Build star list from .ape file ─────────────────────────
+        # .ape x/y  =  DAOStarFinder (0-indexed window px) × xbin
+        # astrometry.Solver.solve(stars=...) expects 0-indexed pixel coords
+        ape_path = (self.data[0]['out_ape']
+                    if self.data else
+                    os.path.splitext(ref_hcm)[0] + '.ape')
+        if not os.path.exists(ape_path):
+            print(f"{RED}[solvwcs] .ape file not found: {ape_path}. "
+                  f"Run setaper() first.{RESET}")
+            return None
+
+        try:
+            with open(ape_path) as fh:
+                ape_json = json.load(fh)
+            # layout: ["hipercam.MccdAper",
+            #          [ccd, ["hipercam.CcdAper", [id, {...}], ...]]]
+            ccd_block = ape_json[1][1]   # starts with "hipercam.CcdAper"
+            stars = []
+            for entry in ccd_block[1:]:  # skip the type-string element
+                ap = entry[1]
+                stars.append((ap['x'] / xbin, ap['y'] / ybin))
+            print(f"[solvwcs] {len(stars)} stars loaded from .ape")
+        except Exception as e:
+            print(f"{RED}[solvwcs] Failed to parse .ape file: {e}{RESET}")
+            return None
+
+        # ── 4. Build position hint ────────────────────────────────────
+        # Priority: manual ra_center/dec_center → HCM header → None
+        if ra_center is None or dec_center is None:
+            try:
+                hdr = mccd.header
+                # common HiPERCAM/ULTRASPEC header keys for telescope pointing
+                for ra_key in ('RA', 'RADEG', 'TELRA', 'RA_TEL'):
+                    if ra_key in hdr:
+                        ra_val = hdr[ra_key]
+                        # convert HH:MM:SS string to degrees if needed
+                        if isinstance(ra_val, str) and ':' in ra_val:
+                            from astropy.coordinates import Angle
+                            import astropy.units as u
+                            ra_val = Angle(ra_val, unit=u.hourangle).deg
+                        ra_center = float(ra_val)
+                        break
+                for dec_key in ('DEC', 'DECDEG', 'TELDEC', 'DEC_TEL'):
+                    if dec_key in hdr:
+                        dec_val = hdr[dec_key]
+                        if isinstance(dec_val, str) and ':' in dec_val:
+                            from astropy.coordinates import Angle
+                            import astropy.units as u
+                            dec_val = Angle(dec_val, unit=u.deg).deg
+                        dec_center = float(dec_val)
+                        break
+                if ra_center is not None and dec_center is not None:
+                    print(f"[solvwcs] Position hint from HCM header: "
+                          f"RA={ra_center:.4f}°  Dec={dec_center:.4f}°")
+                else:
+                    print("[solvwcs] No position hint found in header "
+                          "— blind solve (slow).")
+            except Exception:
+                print("[solvwcs] Could not read position from header "
+                      "— blind solve (slow).")
+
+        size_hint = astrometry.SizeHint(
+            lower_arcsec_per_pixel=scale_low,
+            upper_arcsec_per_pixel=scale_high,
+        )
+        position_hint = None
+        if ra_center is not None and dec_center is not None:
+            position_hint = astrometry.PositionHint(
+                ra_deg=ra_center,
+                dec_deg=dec_center,
+                radius_deg=radius,
+            )
+
+        print(f"{BLUE}[solvwcs] Running astrometry solver ...{RESET}")
+        with astrometry.Solver(
+            astrometry.series_5200.index_files(
+                cache_directory=astrometry_cache,
+                scales={4, 5, 6},
+            )
+            + astrometry.series_4200.index_files(
+                cache_directory=astrometry_cache,
+                scales={6, 7, 12},
+            )
+        ) as solver:
+            solution = solver.solve(
+                stars=stars,
+                size_hint=size_hint,
+                position_hint=position_hint,
+                solution_parameters=astrometry.SolutionParameters(),
+            )
+
+        if not solution.has_match():
+            print(f"{RED}[solvwcs] No WCS solution found. "
+                  f"Try adjusting scale_low/scale_high or providing "
+                  f"ra_center/dec_center hint.{RESET}")
+            return None
+
+        match = solution.best_match()
+        wcs = match.wcs   # astropy WCS object, 0-indexed pixel convention
+        print(f"[solvwcs] Solved:  RA={match.center_ra_deg:.5f}°  "
+              f"Dec={match.center_dec_deg:.5f}°")
+
+        # ── 5. Parse reduce log file ──────────────────────────────────
+        if log_file is None:
+            log_file = os.path.join(self.base_dir, 'all.log')
+        if not os.path.exists(log_file):
+            print(f"{RED}[solvwcs] Log file not found: {log_file}{RESET}")
+            return None
+
+        ccd_log = self._read_hlog(log_file, ccd_label)
+        if ccd_log is None:
+            return None
+
+        # ── 6. Apply WCS → RA/DEC for every aperture, every frame ─────
+        # log x/y = 0-indexed window pixel × xbin
+        #   x_pix (0-indexed) = log_x / xbin
+        # astropy WCS.pixel_to_world() takes 0-indexed pixels
+        records = []
+        for ap_label in sorted(ccd_log.keys(),
+                                key=lambda k: int(k) if str(k).isdigit() else k):
+            ts = ccd_log[ap_label]
+            x_log = np.asarray(ts['x'], dtype=float)
+            y_log = np.asarray(ts['y'], dtype=float)
+            t_arr = np.asarray(ts['t'], dtype=float)
+            x_pix = x_log / xbin
+            y_pix = y_log / ybin
+
+            try:
+                sky     = wcs.pixel_to_world(x_pix, y_pix)
+                ra_arr  = np.atleast_1d(sky.ra.deg)
+                dec_arr = np.atleast_1d(sky.dec.deg)
+            except Exception as exc:
+                print(f"[solvwcs] WCS transform failed (ap {ap_label}): {exc}")
+                ra_arr  = np.full(len(x_log), np.nan)
+                dec_arr = np.full(len(x_log), np.nan)
+
+            for i in range(len(x_log)):
+                records.append({
+                    'frame':    i + 1,
+                    'mjd':      t_arr[i],
+                    'aperture': int(ap_label) if str(ap_label).isdigit()
+                                else ap_label,
+                    'x_log':   x_log[i],
+                    'y_log':   y_log[i],
+                    'x_pix':   x_pix[i],
+                    'y_pix':   y_pix[i],
+                    'ra_deg':  ra_arr[i],
+                    'dec_deg': dec_arr[i],
+                })
+
+        if not records:
+            print(f"{RED}[solvwcs] No data extracted from log file.{RESET}")
+            return None
+
+        df = pd.DataFrame(records)
+        out_path = os.path.join(self.base_dir, output_csv)
+        df.to_csv(out_path, index=False)
+        n_ap = df['aperture'].nunique()
+        n_fr = df['frame'].nunique()
+        print(f"{BLUE}[solvwcs] {n_ap} apertures × {n_fr} frames "
+              f"→ {out_path}{RESET}")
+        return df
+
+    # ------------------------------------------------------------------
+    def _read_hlog(self, log_file, ccd_label):
+        """
+        Parse a HiPERCAM reduce log file.
+
+        Returns
+        -------
+        dict  {ap_label: {'t': ndarray, 'x': ndarray, 'y': ndarray}}
+        or None on failure.
+        """
+        # ── attempt 1: hipercam.hlog.Hlog ────────────────────────────
+        try:
+            import importlib
+            hlog_mod = importlib.import_module('hipercam.hlog')
+            log_data = hlog_mod.Hlog.read(log_file)
+            ccd = log_data[ccd_label]
+            result = {
+                ap: {'t': np.asarray(ts.t),
+                     'x': np.asarray(ts.x),
+                     'y': np.asarray(ts.y)}
+                for ap, ts in ccd.items()
+            }
+            print(f"[solvwcs] Log parsed via hipercam.hlog "
+                  f"({len(result)} apertures)")
+            return result
+        except Exception:
+            pass
+
+        # ── attempt 2: pandas fallback (ASCII log) ────────────────────
+        try:
+            import pandas as pd
+            header_cols = None
+            with open(log_file) as fh:
+                for line in fh:
+                    stripped = line.lstrip('#').strip()
+                    if (line.startswith('#') and
+                            ('MJD' in stripped or 'mjd' in stripped)):
+                        header_cols = stripped.split()
+                        break
+
+            if header_cols is None:
+                print(f"{RED}[solvwcs] Cannot identify column names "
+                      f"in {log_file}{RESET}")
+                return None
+
+            df = pd.read_csv(log_file, comment='#', sep=r'\s+',
+                             names=header_cols, engine='python')
+            df.columns = [c.lower() for c in df.columns]
+
+            mjd_col = next((c for c in df.columns
+                            if c in ('mjd', 'tmid', 't')), df.columns[1])
+            ap_ids = sorted(
+                {c.split('_')[1] for c in df.columns
+                 if c.startswith('x_') and c.split('_')[1].isdigit()},
+                key=int)
+
+            result = {}
+            for ap in ap_ids:
+                xc, yc = f'x_{ap}', f'y_{ap}'
+                if xc in df.columns and yc in df.columns:
+                    result[ap] = {
+                        't': df[mjd_col].to_numpy(dtype=float),
+                        'x': df[xc].to_numpy(dtype=float),
+                        'y': df[yc].to_numpy(dtype=float),
+                    }
+            print(f"[solvwcs] Log parsed via pandas fallback "
+                  f"({len(result)} apertures)")
+            return result if result else None
+        except Exception as exc:
+            print(f"{RED}[solvwcs] Log parse failed: {exc}{RESET}")
+            return None
         
     def setaper(self, ccd_label='1', win_label='1', SIGMA_THRESHOLD=1.5,
                 output_plot="detection_labeled.png", SKIP_BRIGHTEST=10,
                 MARGIN_LEFT=15, MARGIN_RIGHT=15, MARGIN_BOTTOM=5, MARGIN_TOP=27,
-                R_TARG=None, R_SKY1=16, R_SKY2=24, frame=5, diagnostics=False):
+                R_TARG=None, R_SKY1=16, R_SKY2=24, frame=5, diagnostics=False,
+                solve_wcs=False, **wcs_kwargs):
         """
         Detect stars and write a HiPERCAM aperture (.ape) file.
 
         In single_run mode one representative frame (index=frame) is used.
         In multi-run mode every file in the list gets its own .ape file.
+
+        Parameters
+        ----------
+        solve_wcs : bool
+            If True, call solvwcs() automatically after the .ape file is
+            written.  Pass any solvwcs keyword arguments via **wcs_kwargs
+            (e.g. ra_center=123.4, dec_center=45.6, scale_low=0.35).
         """
         hcm_files = []
         for lis_path in self.lis:
@@ -470,6 +779,10 @@ class Photometry:
                     SIGMA_THRESHOLD, SKIP_BRIGHTEST,
                     MARGIN_LEFT, MARGIN_RIGHT, MARGIN_BOTTOM, MARGIN_TOP,
                     R_TARG, R_SKY1, R_SKY2, diagnostics)
+
+        if solve_wcs:
+            self.solvwcs(ccd_label=ccd_label, win_label=win_label,
+                         **wcs_kwargs)
 
     def _detect_and_write_ape(self, target_file, ccd_label, win_label,
                                SIGMA_THRESHOLD, SKIP_BRIGHTEST,
