@@ -440,8 +440,8 @@ class CompleteUltraspecPipeline:
     # --- STAGE 4: APERTURE SETUP ---
     def setaper(self, ccd_label='1', win_label='1', SIGMA_THRESHOLD=5,
                 output_plot="detection_labeled.png", output_ape_name="ape.ape",
-                MARGIN_LEFT=15, MARGIN_RIGHT=15, MARGIN_BOTTOM=5, MARGIN_TOP=25,
-                R_TARG=10, R_SKY1=15, R_SKY2=20):
+                MARGIN_LEFT=15, MARGIN_RIGHT=15, MARGIN_BOTTOM=5, MARGIN_TOP=30,
+                R_TARG=10, R_SKY1=15, R_SKY2=20, ignore_top_n=5):
         
         base_path = self.dir_save
         hcm_files = glob.glob(os.path.join(base_path, "run*.hcm"))
@@ -478,9 +478,9 @@ class CompleteUltraspecPipeline:
                 sources.reverse()
 
                 print(f"Original source count: {len(sources)}")
-                if len(sources) > 5:
+                if len(sources) > ignore_top_n:
                     print("Ignoring first 3 brightest stars...")
-                    sources = sources[3:]
+                    sources = sources[ignore_top_n:]
                 else:
                     print("Warning: Less than 3 stars found. Keeping all.")
 
@@ -522,16 +522,17 @@ class CompleteUltraspecPipeline:
                 for i, source in enumerate(sources):
                     x, y = source['xcentroid'], source['ycentroid']
                     ap_number = i + 1
-                    ax.add_patch(patches.Circle((x, y), R_TARG, edgecolor='lime', facecolor='none', lw=1.5))
-                    ax.add_patch(patches.Circle((x, y), R_SKY1, edgecolor='red', facecolor='none', lw=1, linestyle='--'))
-                    ax.add_patch(patches.Circle((x, y), R_SKY2, edgecolor='red', facecolor='none', lw=1, linestyle='--'))
-                    ax.text(x, y + R_SKY2 + 2, str(ap_number), color='cyan', fontsize=12, fontweight='bold', ha='center', va='bottom')
+                    ax.add_patch(patches.Circle((x, y), R_TARG/bining, edgecolor='lime', facecolor='none', lw=1.5))
+                    ax.add_patch(patches.Circle((x, y), R_SKY1/bining, edgecolor='red', facecolor='none', lw=1, linestyle='--'))
+                    ax.add_patch(patches.Circle((x, y), R_SKY2/bining, edgecolor='red', facecolor='none', lw=1, linestyle='--'))
+                    ax.text(x, y + R_SKY2/bining + 2, str(ap_number), color='cyan', fontsize=12, fontweight='bold', ha='center', va='bottom')
                 
                 plt.tight_layout()
                 save_path = os.path.join(self.dir_figs, output_plot)
                 plt.savefig(save_path)
                 print(f"✅ Plot saved: {save_path}")
                 plt.show() 
+                
             else:
                 print("❌ No stars found within the margin.")
         else:

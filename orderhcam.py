@@ -1,4 +1,4 @@
-import os
+ import os
 import sys
 import math
 import shutil
@@ -711,7 +711,7 @@ class Reduction:
             zscale = ZScaleInterval()
             vmin, vmax = zscale.get_limits(data)
             ax.imshow(data, origin='lower', cmap='Greys', vmin=vmin, vmax=vmax)
-            
+
             # Draw the safe margin box (dashed yellow line)
             rect = patches.Rectangle((MARGIN_LEFT, MARGIN_BOTTOM), 
                                      w - MARGIN_LEFT - MARGIN_RIGHT, 
@@ -777,50 +777,7 @@ class Reduction:
                 for _ in range(12):
                     try: print(next(f), end='')
                     except StopIteration: break
-    # def modify_red(self, red_file="reduce.red", **kwargs):
-    #     if not os.path.exists(red_file):
-    #         print(f"{RED}Error: File '{red_file}' not found.{RESET}")
-    #         return
-
-    #     print(f"{BLUE}#### Modifying {red_file} ####{RESET}")
-        
-    #     with open(red_file, 'r') as f:
-    #         lines = f.readlines()
-
-    #     new_lines = []
-    #     modified_keys = set()
-
-    #     for line in lines:
-    #         updated = False
-           
-    #         for key, value in kwargs.items():
-                
-    #             pattern = rf"^{key}\s*=\s*"
-    #             if re.match(pattern, line.strip()):
-    #                 comment = ""
-    #                 if "#" in line:
-    #                     comment = " # " + line.split("#", 1)[1].strip()
-                    
-    #                 new_lines.append(f"{key} = {value}{comment}\n")
-    #                 modified_keys.add(key)
-    #                 updated = True
-    #                 break
-            
-    #         if not updated:
-    #             new_lines.append(line)
-
-    #     with open(red_file, 'w') as f:
-    #         f.writelines(new_lines)
-
-    #     for k in kwargs.keys():
-    #         if k in modified_keys:
-    #             print(f"   [Modified] {k} -> {kwargs[k]}")
-    #         else:
-    #             print(f"   [Skip] Key '{k}' not found in file (No changes made).")
-
-    #     print(f" {red_file} updated successfully.")
-
-
+  
 
 
     def modify_red(self, red_file="reduce.red", target_section=None, **kwargs):
@@ -862,7 +819,7 @@ class Reduction:
                     if "#" in line:
                         comment = " # " + line.split("#", 1)[1].strip()
                     
-                    # เขียนใหม่ใน Format: key = value (เว้นวรรคให้ถูกต้อง)
+
                     new_lines.append(f"{key} = {value}{comment}\n")
                     modified_keys.add(key)
                     updated = True
