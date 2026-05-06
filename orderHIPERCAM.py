@@ -1250,7 +1250,7 @@ class Photometry:
     # ------------------------------------------------------------------
     def plot_with_log(self, log_filename, ccd_num='1'):
         df_log, n_aps = read_hipercam_log(log_filename)
-        df_log.to_csv(os.path.join(self.bias_dir, 'all.csv'))
+        df_log.to_csv(os.path.join(self.base_dir, 'all.csv'))
         print(f'[Plot Check Tracking] Save {os.path.join(self.bias_dir, 'all.csv')}')
         
         if df_log is None:
