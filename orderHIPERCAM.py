@@ -1,11 +1,14 @@
 """
 auto_hcam_v3
 """
+import logging
 import os
 import math
 import glob
 import json
 import re
+from pathlib import Path
+import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -20,6 +23,39 @@ import hipercam.scripts as scripts
 BLUE = '\033[94m'
 RED = '\033[91m'
 RESET = '\033[0m'
+
+# Instrument plate scale arcsec/px unbinned — ULTRASPEC on TNT
+ULTRASPEC_SCALE_ARCSEC_PX = 0.45
+
+
+def read_hipercam_log(filename):
+    """read .log then return DataFrame """
+    if not os.path.exists(filename):
+        return None, 0
+
+    base_cols = ['CCD', 'nframe', 'MJD', 'MJDok', 'Exptim', 'mfwhm', 'mbeta']
+    ap_cols_template = ['x', 'xe', 'y', 'ye', 'fwhm', 'fwhme', 'beta', 'betae', 
+                        'counts', 'countse', 'sky', 'skye', 'nsky', 'nrej', 'cmax', 'flag']
+
+    max_aperture = 0
+    with open(filename, 'r') as f:
+        for line in f:
+            if line.startswith('#') and 'flag_' in line:
+                parts = line.split()
+                for part in parts:
+                    if part.startswith('flag_'):
+                        try:
+                            ap = int(part.replace('flag_', ''))
+                            if ap > max_aperture: max_aperture = ap
+                        except: pass
+            if not line.startswith('#'): break 
+
+    all_cols = base_cols.copy()
+    for i in range(1, max_aperture + 1):
+        all_cols.extend([f"{col}_{i}" for col in ap_cols_template])
+
+    df = pd.read_csv(filename, comment='#', sep=r'\s+', header=None, names=all_cols)
+    return df, max_aperture
 
 
 class Hipercam_setup:
@@ -381,7 +417,7 @@ class Hipercam_setup:
                 print(f"{RED}Warning: No 'data' key found in your input_run dictionary! Skipping reduction.{RESET}")
                 return
                 
-    
+
             # data_subset = {k: v for k, v in self.input_run_ul.items()
             #                if k.startswith('data')}
             
@@ -431,327 +467,16 @@ class Photometry:
         self.data = []
         self.entries_to_process = []
 
-    def solvwcs(self, log_file=None, ccd_label='1', win_label='1',
-                scale_low=0.3, scale_high=1.5,
-                ra_center=None, dec_center=None, radius=5.0,
-                output_csv='wcs_radec.csv', frame_idx=3,
-                astrometry_cache='astrometry_cache'):
-        """
-        Solve WCS from the .ape star catalog produced by setaper(), then
-        transform every aperture (x, y) in the reduce .log to (RA, DEC)
-        for all frames.
-
-        Requires the ``astrometry`` Python package (pip install astrometry).
-
-        Parameters
-        ----------
-        log_file : str, optional
-            Path to reduce .log file. Defaults to ``base_dir/all.log``.
-        ccd_label : str
-            CCD label used in setaper() and reduce().
-        win_label : str
-            Window label (e.g. '1').
-        scale_low, scale_high : float
-            Plate-scale bounds in arcsec/pixel.
-        ra_center, dec_center : float, optional
-            Field-centre hint in degrees (speeds up solve considerably).
-        radius : float
-            Search radius in degrees when a centre hint is given.
-        output_csv : str
-            Output CSV filename saved inside ``base_dir``.
-        frame_idx : int
-            Index into the HCM file list used as the reference frame.
-            Should match the frame used by setaper() so the .ape file
-            is consistent.
-        astrometry_cache : str
-            Directory where astrometry.net index files are cached.
-
-        Returns
-        -------
-        pandas.DataFrame or None
-            Columns: frame, mjd, aperture, x_log, y_log, x_pix, y_pix,
-            ra_deg, dec_deg.
-        """
-        import astrometry
-        import pandas as pd
-
-        # ── 1. Collect HCM file list ──────────────────────────────────
-        hcm_files = []
-        for lis_path in self.lis:
-            if os.path.exists(lis_path):
-                with open(lis_path) as fh:
-                    hcm_files.extend(l.strip() for l in fh if l.strip())
-        if not hcm_files:
-            print(f"{RED}[solvwcs] No HCM files found in list files.{RESET}")
-            return None
-
-        ref_idx = min(frame_idx, len(hcm_files) - 1)
-        ref_hcm = hcm_files[ref_idx]
-        print(f"{BLUE}[solvwcs] Reference frame [{ref_idx}]: "
-              f"{os.path.basename(ref_hcm)}{RESET}")
-
-        # ── 2. Get binning from reference window ──────────────────────
-        try:
-            mccd = hcam.MCCD.read(ref_hcm)
-            window = mccd[ccd_label][win_label]
-            xbin = int(getattr(window, 'xbin', 1))
-            ybin = int(getattr(window, 'ybin', 1))
-        except Exception as e:
-            print(f"{RED}[solvwcs] Cannot read reference frame: {e}{RESET}")
-            return None
-
-        # ── 3. Build star list from .ape file ─────────────────────────
-        # .ape x/y  =  DAOStarFinder (0-indexed window px) × xbin
-        # astrometry.Solver.solve(stars=...) expects 0-indexed pixel coords
-        ape_path = (self.data[0]['out_ape']
-                    if self.data else
-                    os.path.splitext(ref_hcm)[0] + '.ape')
-        if not os.path.exists(ape_path):
-            print(f"{RED}[solvwcs] .ape file not found: {ape_path}. "
-                  f"Run setaper() first.{RESET}")
-            return None
-
-        try:
-            with open(ape_path) as fh:
-                ape_json = json.load(fh)
-            # layout: ["hipercam.MccdAper",
-            #          [ccd, ["hipercam.CcdAper", [id, {...}], ...]]]
-            ccd_block = ape_json[1][1]   # starts with "hipercam.CcdAper"
-            stars = []
-            for entry in ccd_block[1:]:  # skip the type-string element
-                ap = entry[1]
-                stars.append((ap['x'] / xbin, ap['y'] / ybin))
-            print(f"[solvwcs] {len(stars)} stars loaded from .ape")
-        except Exception as e:
-            print(f"{RED}[solvwcs] Failed to parse .ape file: {e}{RESET}")
-            return None
-
-        # ── 4. Build position hint ────────────────────────────────────
-        # Priority: manual ra_center/dec_center → HCM header → None
-        if ra_center is None or dec_center is None:
-            try:
-                hdr = mccd.header
-                # common HiPERCAM/ULTRASPEC header keys for telescope pointing
-                for ra_key in ('RA', 'RADEG', 'TELRA', 'RA_TEL'):
-                    if ra_key in hdr:
-                        ra_val = hdr[ra_key]
-                        # convert HH:MM:SS string to degrees if needed
-                        if isinstance(ra_val, str) and ':' in ra_val:
-                            from astropy.coordinates import Angle
-                            import astropy.units as u
-                            ra_val = Angle(ra_val, unit=u.hourangle).deg
-                        ra_center = float(ra_val)
-                        break
-                for dec_key in ('DEC', 'DECDEG', 'TELDEC', 'DEC_TEL'):
-                    if dec_key in hdr:
-                        dec_val = hdr[dec_key]
-                        if isinstance(dec_val, str) and ':' in dec_val:
-                            from astropy.coordinates import Angle
-                            import astropy.units as u
-                            dec_val = Angle(dec_val, unit=u.deg).deg
-                        dec_center = float(dec_val)
-                        break
-                if ra_center is not None and dec_center is not None:
-                    print(f"[solvwcs] Position hint from HCM header: "
-                          f"RA={ra_center:.4f}°  Dec={dec_center:.4f}°")
-                else:
-                    print("[solvwcs] No position hint found in header "
-                          "— blind solve (slow).")
-            except Exception:
-                print("[solvwcs] Could not read position from header "
-                      "— blind solve (slow).")
-
-        size_hint = astrometry.SizeHint(
-            lower_arcsec_per_pixel=scale_low,
-            upper_arcsec_per_pixel=scale_high,
-        )
-        position_hint = None
-        if ra_center is not None and dec_center is not None:
-            position_hint = astrometry.PositionHint(
-                ra_deg=ra_center,
-                dec_deg=dec_center,
-                radius_deg=radius,
-            )
-
-        print(f"{BLUE}[solvwcs] Running astrometry solver ...{RESET}")
-        with astrometry.Solver(
-            astrometry.series_5200.index_files(
-                cache_directory=astrometry_cache,
-                scales={4, 5, 6},
-            )
-            + astrometry.series_4200.index_files(
-                cache_directory=astrometry_cache,
-                scales={6, 7, 12},
-            )
-        ) as solver:
-            solution = solver.solve(
-                stars=stars,
-                size_hint=size_hint,
-                position_hint=position_hint,
-                solution_parameters=astrometry.SolutionParameters(),
-            )
-
-        if not solution.has_match():
-            print(f"{RED}[solvwcs] No WCS solution found. "
-                  f"Try adjusting scale_low/scale_high or providing "
-                  f"ra_center/dec_center hint.{RESET}")
-            return None
-
-        match = solution.best_match()
-        wcs = match.wcs   # astropy WCS object, 0-indexed pixel convention
-        print(f"[solvwcs] Solved:  RA={match.center_ra_deg:.5f}°  "
-              f"Dec={match.center_dec_deg:.5f}°")
-
-        # ── 5. Parse reduce log file ──────────────────────────────────
-        if log_file is None:
-            log_file = os.path.join(self.base_dir, 'all.log')
-        if not os.path.exists(log_file):
-            print(f"{RED}[solvwcs] Log file not found: {log_file}{RESET}")
-            return None
-
-        ccd_log = self._read_hlog(log_file, ccd_label)
-        if ccd_log is None:
-            return None
-
-        # ── 6. Apply WCS → RA/DEC for every aperture, every frame ─────
-        # log x/y = 0-indexed window pixel × xbin
-        #   x_pix (0-indexed) = log_x / xbin
-        # astropy WCS.pixel_to_world() takes 0-indexed pixels
-        records = []
-        for ap_label in sorted(ccd_log.keys(),
-                                key=lambda k: int(k) if str(k).isdigit() else k):
-            ts = ccd_log[ap_label]
-            x_log = np.asarray(ts['x'], dtype=float)
-            y_log = np.asarray(ts['y'], dtype=float)
-            t_arr = np.asarray(ts['t'], dtype=float)
-            x_pix = x_log / xbin
-            y_pix = y_log / ybin
-
-            try:
-                sky     = wcs.pixel_to_world(x_pix, y_pix)
-                ra_arr  = np.atleast_1d(sky.ra.deg)
-                dec_arr = np.atleast_1d(sky.dec.deg)
-            except Exception as exc:
-                print(f"[solvwcs] WCS transform failed (ap {ap_label}): {exc}")
-                ra_arr  = np.full(len(x_log), np.nan)
-                dec_arr = np.full(len(x_log), np.nan)
-
-            for i in range(len(x_log)):
-                records.append({
-                    'frame':    i + 1,
-                    'mjd':      t_arr[i],
-                    'aperture': int(ap_label) if str(ap_label).isdigit()
-                                else ap_label,
-                    'x_log':   x_log[i],
-                    'y_log':   y_log[i],
-                    'x_pix':   x_pix[i],
-                    'y_pix':   y_pix[i],
-                    'ra_deg':  ra_arr[i],
-                    'dec_deg': dec_arr[i],
-                })
-
-        if not records:
-            print(f"{RED}[solvwcs] No data extracted from log file.{RESET}")
-            return None
-
-        df = pd.DataFrame(records)
-        out_path = os.path.join(self.base_dir, output_csv)
-        df.to_csv(out_path, index=False)
-        n_ap = df['aperture'].nunique()
-        n_fr = df['frame'].nunique()
-        print(f"{BLUE}[solvwcs] {n_ap} apertures × {n_fr} frames "
-              f"→ {out_path}{RESET}")
-        return df
-
-    # ------------------------------------------------------------------
-    def _read_hlog(self, log_file, ccd_label):
-        """
-        Parse a HiPERCAM reduce log file.
-
-        Returns
-        -------
-        dict  {ap_label: {'t': ndarray, 'x': ndarray, 'y': ndarray}}
-        or None on failure.
-        """
-        # ── attempt 1: hipercam.hlog.Hlog ────────────────────────────
-        try:
-            import importlib
-            hlog_mod = importlib.import_module('hipercam.hlog')
-            log_data = hlog_mod.Hlog.read(log_file)
-            ccd = log_data[ccd_label]
-            result = {
-                ap: {'t': np.asarray(ts.t),
-                     'x': np.asarray(ts.x),
-                     'y': np.asarray(ts.y)}
-                for ap, ts in ccd.items()
-            }
-            print(f"[solvwcs] Log parsed via hipercam.hlog "
-                  f"({len(result)} apertures)")
-            return result
-        except Exception:
-            pass
-
-        # ── attempt 2: pandas fallback (ASCII log) ────────────────────
-        try:
-            import pandas as pd
-            header_cols = None
-            with open(log_file) as fh:
-                for line in fh:
-                    stripped = line.lstrip('#').strip()
-                    if (line.startswith('#') and
-                            ('MJD' in stripped or 'mjd' in stripped)):
-                        header_cols = stripped.split()
-                        break
-
-            if header_cols is None:
-                print(f"{RED}[solvwcs] Cannot identify column names "
-                      f"in {log_file}{RESET}")
-                return None
-
-            df = pd.read_csv(log_file, comment='#', sep=r'\s+',
-                             names=header_cols, engine='python')
-            df.columns = [c.lower() for c in df.columns]
-
-            mjd_col = next((c for c in df.columns
-                            if c in ('mjd', 'tmid', 't')), df.columns[1])
-            ap_ids = sorted(
-                {c.split('_')[1] for c in df.columns
-                 if c.startswith('x_') and c.split('_')[1].isdigit()},
-                key=int)
-
-            result = {}
-            for ap in ap_ids:
-                xc, yc = f'x_{ap}', f'y_{ap}'
-                if xc in df.columns and yc in df.columns:
-                    result[ap] = {
-                        't': df[mjd_col].to_numpy(dtype=float),
-                        'x': df[xc].to_numpy(dtype=float),
-                        'y': df[yc].to_numpy(dtype=float),
-                    }
-            print(f"[solvwcs] Log parsed via pandas fallback "
-                  f"({len(result)} apertures)")
-            return result if result else None
-        except Exception as exc:
-            print(f"{RED}[solvwcs] Log parse failed: {exc}{RESET}")
-            return None
-        
     def setaper(self, ccd_label='1', win_label='1', SIGMA_THRESHOLD=1.5,
                 output_plot="detection_labeled.png", SKIP_BRIGHTEST=10,
                 MARGIN_LEFT=15, MARGIN_RIGHT=15, MARGIN_BOTTOM=5, MARGIN_TOP=27,
-                R_TARG=None, R_SKY1=16, R_SKY2=24, frame=5, diagnostics=False,
-                solve_wcs=False, **wcs_kwargs):
+                R_TARG=None, R_SKY1=16, R_SKY2=24, frame=5, diagnostics=False):
         """
         Detect stars and write a HiPERCAM aperture (.ape) file.
 
         In single_run mode one representative frame (index=frame) is used.
         In multi-run mode every file in the list gets its own .ape file.
 
-        Parameters
-        ----------
-        solve_wcs : bool
-            If True, call solvwcs() automatically after the .ape file is
-            written.  Pass any solvwcs keyword arguments via **wcs_kwargs
-            (e.g. ra_center=123.4, dec_center=45.6, scale_low=0.35).
         """
         hcm_files = []
         for lis_path in self.lis:
@@ -780,9 +505,7 @@ class Photometry:
                     MARGIN_LEFT, MARGIN_RIGHT, MARGIN_BOTTOM, MARGIN_TOP,
                     R_TARG, R_SKY1, R_SKY2, diagnostics)
 
-        if solve_wcs:
-            self.solvwcs(ccd_label=ccd_label, win_label=win_label,
-                         **wcs_kwargs)
+   
 
     def _detect_and_write_ape(self, target_file, ccd_label, win_label,
                                SIGMA_THRESHOLD, SKIP_BRIGHTEST,
@@ -1010,6 +733,7 @@ class Photometry:
                 print(f"{RED}Error: No list files available for reduction.{RESET}")
                 return
             red_file = self.entries_to_process[0].get('out_red')
+            print(red_file)
             if not red_file or not os.path.exists(red_file):
                 print(f"{RED}Error: Reduction file not found. Run genred() first.{RESET}")
                 return
@@ -1031,5 +755,568 @@ class Photometry:
                 print(f" SUCCESS! Log saved to: {log_file}")
             except Exception as e:
                 print(f"{RED} Reduction Failed: {e}{RESET}")
+                return
+
+            if diagnostics:
+                
+                full_log = os.path.join(self.base_dir, log_file)
+                print(red_file, full_log)
+                print(f"{BLUE}--- Diagnostics: running plot_with_log ---{RESET}")
+                self.plot_with_log(full_log)
+                print(f"{BLUE}--- Diagnostics: running plot_with_zoom ---{RESET}")
+                self.plot_with_zoom(full_log)
         else:
             print("Not implemented yet")
+
+    # ------------------------------------------------------------------
+    def solvwcs(self, ccd_label='1', win_label='1', log_file=None,
+                output_csv='wcs_radec.csv',
+                ra_center=None, dec_center=None, radius=5.0,
+                scale_low=None, scale_high=None,
+                astrometry_cache='astrometry_cache',
+                verbose=False):
+        """
+        Solve WCS for every frame using aperture x/y from the reduce .log.
+
+        Strategy
+        --------
+        For each frame, the x/y positions of ALL apertures are passed as
+        the star catalog to astrometry.net.
+
+          - Frame 0  : blind solve (or position-hinted if ra_center/dec_center
+                       are provided).
+          - Frame N>0: previous frame's solved centre used as position hint,
+                       which makes each subsequent solve fast.
+
+        A single WCS is needed for the whole observation only if the field
+        does not drift. The per-frame strategy handles small tracking errors
+        automatically.
+
+        Parameters
+        ----------
+        ccd_label : str
+            CCD label matching the one used in setaper/reduce.
+        win_label : str
+            Window label (e.g. '1').
+        log_file : str, optional
+            Path to reduce .log file. Defaults to <base_dir>/all.log.
+        output_csv : str
+            Output CSV filename written inside base_dir.
+        ra_center, dec_center : float, optional
+            Position hint in degrees for the first-frame solve.
+        radius : float
+            Search radius in degrees for the position hint.
+        scale_low, scale_high : float, optional
+            Plate-scale bounds arcsec/binned-px. Derived automatically from
+            ULTRASPEC_SCALE_ARCSEC_PX × xbin if not provided.
+        astrometry_cache : str
+            Directory where astrometry.net index files are cached.
+        verbose : bool
+            Print full internal solver progress (INFO-level logging).
+
+        Returns
+        -------
+        pandas.DataFrame or None
+            Columns: frame, mjd, aperture, x, y, ra_deg, dec_deg
+        """
+        import astrometry
+        import pandas as pd
+
+        # ── 1. Get binning from a reference HCM ──────────────────────
+        hcm_files = []
+        for lis_path in self.lis:
+            if os.path.exists(lis_path):
+                with open(lis_path) as fh:
+                    hcm_files.extend(l.strip() for l in fh if l.strip())
+        if not hcm_files:
+            print(f"{RED}[solvwcs] No HCM files found in list files.{RESET}")
+            return None
+
+        ref_hcm = hcm_files[min(3, len(hcm_files) - 1)]
+        try:
+            mccd   = hcam.MCCD.read(ref_hcm)
+            window = mccd[ccd_label][win_label]
+            xbin   = int(getattr(window, 'xbin', 1))
+            ybin   = int(getattr(window, 'ybin', 1))
+        except Exception as e:
+            print(f"{RED}[solvwcs] Cannot read reference HCM: {e}{RESET}")
+            return None
+
+        eff_scale = ULTRASPEC_SCALE_ARCSEC_PX * xbin
+        if scale_low  is None:
+            scale_low  = eff_scale * 0.95
+        if scale_high is None:
+            scale_high = eff_scale * 1.05
+        print(f"[solvwcs] Binning={xbin}x{ybin}  "
+              f"scale={eff_scale:.3f}\"/px  "
+              f"hint range [{scale_low:.3f}, {scale_high:.3f}]")
+
+        # ── 2. Read log ───────────────────────────────────────────────
+        if log_file is None:
+            log_file = os.path.join(self.base_dir, 'all.log')
+        ccd_log = self._read_hlog(log_file, ccd_label)
+        if ccd_log is None:
+            return None
+
+        ap_labels = sorted(ccd_log.keys(),
+                           key=lambda k: int(k) if str(k).isdigit() else k)
+        n_frames = len(next(iter(ccd_log.values()))['t'])
+        n_aps    = len(ap_labels)
+        print(f"[solvwcs] {n_aps} apertures × {n_frames} frames")
+
+        if n_aps < 6:
+            print(f"{RED}[solvwcs] Need ≥6 apertures for plate solving, "
+                  f"got {n_aps}. Run setaper() with more stars.{RESET}")
+            return None
+
+        # ── 3. Load index files as Path objects ───────────────────────
+        # astrometry.Solver calls path.resolve() internally — must be Path
+        def _idx(series, scales, label):
+            try:
+                files   = series.index_files(
+                    cache_directory=astrometry_cache, scales=scales)
+                on_disk = [Path(f) for f in files if Path(f).exists()]
+                print(f"[solvwcs]   {label}: {len(on_disk)} on disk")
+                return on_disk
+            except Exception as e:
+                print(f"[solvwcs]   {label}: {e}")
+                return []
+
+        print("[solvwcs] Loading index files...")
+        index_files = list(dict.fromkeys(
+            _idx(astrometry.series_5200, {2, 3, 4}, "series_5200 {2,3,4}")
+            + _idx(astrometry.series_4200, {2, 3, 4}, "series_4200 {2,3,4}")
+        ))
+        if not index_files:
+            print(f"{RED}[solvwcs] No index files found in "
+                  f"{astrometry_cache}{RESET}")
+            return None
+
+        size_hint = astrometry.SizeHint(lower_arcsec_per_pixel=scale_low,
+                                         upper_arcsec_per_pixel=scale_high)
+        params = astrometry.SolutionParameters(
+            logodds_callback=lambda ll: (
+                astrometry.Action.STOP if ll[0] > 100.0
+                else astrometry.Action.CONTINUE
+            ),
+        )
+
+        if verbose:
+            logging.basicConfig(level=logging.INFO,
+                                format="%(message)s", force=True)
+            logging.getLogger().setLevel(logging.INFO)
+
+        # ── 4. Per-frame solve ────────────────────────────────────────
+        records  = []
+        prev_ra  = ra_center
+        prev_dec = dec_center
+        prev_wcs = None
+
+        print(f"{BLUE}[solvwcs] Solving {n_frames} frames...{RESET}")
+
+        with astrometry.Solver(index_files) as solver:
+            for fi in range(n_frames):
+
+                # Star list for this frame.
+                # Log x/y are in unbinned window-pixel coords (HiPERCAM stores
+                # positions × xbin in the ape file and the log follows the same
+                # convention).  Divide by xbin/ybin to get binned pixel coords
+                # so they match the SizeHint scale (arcsec / binned-px).
+                stars = []
+                for ap in ap_labels:
+                    x = float(ccd_log[ap]['x'][fi]) / xbin
+                    y = float(ccd_log[ap]['y'][fi]) / ybin
+                    if np.isfinite(x) and np.isfinite(y):
+                        stars.append((x, y))
+
+                # Position hint: None for blind frame-0, previous centre after
+                position_hint = None
+                if prev_ra is not None and prev_dec is not None:
+                    position_hint = astrometry.PositionHint(
+                        ra_deg=prev_ra, dec_deg=prev_dec, radius_deg=radius)
+
+                wcs = None
+                if len(stars) >= 6:
+                    solution = solver.solve(
+                        stars=stars,
+                        size_hint=size_hint,
+                        position_hint=position_hint,
+                        solution_parameters=params,
+                    )
+                    if solution.has_match():
+                        match    = solution.best_match()
+                        wcs      = match.astropy_wcs()   # 0-indexed px convention
+                        prev_ra  = match.center_ra_deg
+                        prev_dec = match.center_dec_deg
+                        prev_wcs = wcs
+                        if fi == 0:
+                            print(f"{BLUE}[solvwcs] Frame 0 solved: "
+                                  f"RA={prev_ra:.5f}°  "
+                                  f"Dec={prev_dec:.5f}°{RESET}")
+                    elif fi == 0:
+                        hint_info = (f"RA={prev_ra:.4f} Dec={prev_dec:.4f}"
+                                     if prev_ra is not None else "no hint")
+                        print(f"{RED}[solvwcs] Frame 0 solve failed "
+                              f"({hint_info}).{RESET}")
+                        print(f"{RED}           scale hint [{scale_low:.3f}, "
+                              f"{scale_high:.3f}] arcsec/px — verify this "
+                              f"matches the true plate scale.{RESET}")
+                        if verbose:
+                            logging.getLogger().setLevel(logging.WARNING)
+                        return None
+
+                # Fall back to previous WCS if this frame failed
+                if wcs is None:
+                    wcs = prev_wcs
+
+                # Apply WCS to every aperture in this frame.
+                # Divide by xbin/ybin for the same reason as above.
+                for ap in ap_labels:
+                    x_raw = float(ccd_log[ap]['x'][fi])
+                    y_raw = float(ccd_log[ap]['y'][fi])
+                    mjd   = float(ccd_log[ap]['t'][fi])
+                    x_bin = x_raw / xbin
+                    y_bin = y_raw / ybin
+                    ra = dec = np.nan
+                    if wcs is not None and np.isfinite(x_bin) and np.isfinite(y_bin):
+                        try:
+                            sky = wcs.pixel_to_world(x_bin, y_bin)
+                            ra  = float(sky.ra.deg)
+                            dec = float(sky.dec.deg)
+                        except Exception:
+                            pass
+                    records.append({
+                        'frame':    fi + 1,
+                        'mjd':      mjd,
+                        'aperture': int(ap) if str(ap).isdigit() else ap,
+                        'x':        x_raw,   # keep original log coords in CSV
+                        'y':        y_raw,
+                        'ra_deg':   ra,
+                        'dec_deg':  dec,
+                    })
+
+                if (fi + 1) % 100 == 0 or fi == n_frames - 1:
+                    print(f"[solvwcs]   {fi + 1}/{n_frames} frames done")
+
+        if verbose:
+            logging.getLogger().setLevel(logging.WARNING)
+
+        if not records:
+            print(f"{RED}[solvwcs] No records produced.{RESET}")
+            return None
+
+        df = pd.DataFrame(records)
+        out_path = os.path.join(self.base_dir, output_csv)
+        df.to_csv(out_path, index=False)
+        n_ap = df['aperture'].nunique()
+        n_fr = df['frame'].nunique()
+        print(f"{BLUE}[solvwcs] {n_ap} apertures × {n_fr} frames "
+              f"→ {out_path}{RESET}")
+        return df
+
+    # ------------------------------------------------------------------
+    def _read_hlog(self, log_file, ccd_label):
+        """
+        Parse a HiPERCAM reduce log.
+
+        Returns
+        -------
+        dict {ap_label: {'t': ndarray, 'x': ndarray, 'y': ndarray}} or None.
+        """
+        # Attempt 1: hipercam.hlog API
+        try:
+            import importlib
+            hlog_mod = importlib.import_module('hipercam.hlog')
+            # Constructor signature varies by hipercam version
+            for loader in [lambda: hlog_mod.Hlog(log_file),
+                           lambda: hlog_mod.Hlog.read(log_file)]:
+                try:
+                    log_data = loader()
+                    break
+                except Exception:
+                    continue
+            else:
+                raise RuntimeError("no valid Hlog loader")
+            ccd_data = log_data[str(ccd_label)]
+            result   = {
+                ap: {'t': np.asarray(ts.t),
+                     'x': np.asarray(ts.x),
+                     'y': np.asarray(ts.y)}
+                for ap, ts in ccd_data.items()
+            }
+            print(f"[solvwcs] Log parsed via hipercam.hlog "
+                  f"({len(result)} apertures)")
+            return result
+        except Exception as e:
+            print(f"[solvwcs] hipercam.hlog failed ({e}), trying pandas...")
+
+        # Attempt 2: pandas ASCII fallback
+        # Log header format:  # N = CCD nframe MJD MJDok Exptim ... x_1 xe_1 y_1 ...
+        # Column names start from 'nframe' — skip the leading "N = CCD" tokens.
+        try:
+            import pandas as pd
+            header_cols = None
+            with open(log_file) as fh:
+                for line in fh:
+                    if not line.startswith('#'):
+                        break
+                    tokens = line.lstrip('#').strip().split()
+                    # True header line has both 'nframe' and 'MJD' among many tokens
+                    if 'nframe' in tokens and 'MJD' in tokens:
+                        nframe_idx = tokens.index('nframe')
+                        header_cols = tokens[nframe_idx:]   # strip "N = CCD" prefix
+                        break
+
+            if header_cols is None:
+                print(f"{RED}[solvwcs] Cannot find column header in "
+                      f"{log_file}{RESET}")
+                return None
+
+            df = pd.read_csv(log_file, comment='#', sep=r'\s+',
+                             names=header_cols, engine='python')
+            df.columns = [c.lower() for c in df.columns]
+
+            mjd_col = next((c for c in df.columns
+                            if c in ('mjd', 'mjd_mid', 'tmid', 't')),
+                           df.columns[0])
+
+            # Columns are x_1, y_1, x_2, y_2, ...
+            ap_ids = sorted(
+                {c.split('_')[1] for c in df.columns
+                 if c.startswith('x_')
+                 and len(c.split('_')) == 2
+                 and c.split('_')[1].isdigit()},
+                key=int)
+
+            result = {}
+            for ap in ap_ids:
+                xc, yc = f'x_{ap}', f'y_{ap}'
+                if xc in df.columns and yc in df.columns:
+                    result[ap] = {
+                        't': df[mjd_col].to_numpy(dtype=float),
+                        'x': df[xc].to_numpy(dtype=float),
+                        'y': df[yc].to_numpy(dtype=float),
+                    }
+
+            if result:
+                print(f"[solvwcs] Log parsed via pandas fallback "
+                      f"({len(result)} apertures)")
+                return result
+
+            print(f"{RED}[solvwcs] No x_N/y_N columns found in log.{RESET}")
+            return None
+
+        except Exception as exc:
+            print(f"{RED}[solvwcs] Log parse failed: {exc}{RESET}")
+            return None
+
+    # ------------------------------------------------------------------
+    def plot_with_zoom(self, log_filename, ccd_num='1', zoom_box=15):
+        """
+        Plots a zoomed-in cutout of EVERY aperture for EACH frame.
+        Includes X and Y marginal profile histograms for each star.
+        """
+        zoom_dir = os.path.join(self.base_dir, 'zoom')
+        os.makedirs(zoom_dir, exist_ok=True)
+                     
+        from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+        df_log, n_aps = read_hipercam_log(log_filename)
+        if df_log is None:
+            print(f"{RED}Error: Cannot read log file.{RESET}"); return
+
+        lis_file = self.lis[0] if self.lis else None
+        if not lis_file or not os.path.exists(lis_file):
+            print(f"{RED}Error: List file not found!{RESET}"); return
+
+        with open(lis_file, 'r') as f:
+            hcm_files = [line.strip() for line in f.readlines() if line.strip()]
+
+        n_plot = len(hcm_files)
+        print(f"{BLUE}--- Generating zoomed plots with X/Y Profiles for {n_plot} frames ---{RESET}")
+        
+        zscale = ZScaleInterval()
+
+        for i in range(n_plot):
+            file_path = hcm_files[i]
+            frame_name = os.path.basename(file_path)
+            print(f'Generating zoomed plots F{i} {frame_name}')
+            try:
+                mccd = hcam.MCCD.read(file_path)         
+                data = mccd[ccd_num]['1'].data
+                vmin, vmax = zscale.get_limits(data)
+                
+                if i >= len(df_log):
+                    print(f"{RED}Warning: No log data for frame {i}. Skipping.{RESET}")
+                    continue
+                    
+                frame_data = df_log.iloc[[i]]
+                if frame_data.empty:
+                    continue
+
+                ncols = 5
+                nrows = math.ceil(n_aps / ncols)
+                fig, axs = plt.subplots(nrows, ncols, figsize=(4.5*ncols, 4.5*nrows), 
+                                        gridspec_kw={'wspace': 0.4, 'hspace': 0.4}, facecolor='whitesmoke')
+                axs_flat = np.atleast_1d(axs).flatten()
+
+                fig.suptitle(f"Frame {i+1}: {frame_name}", fontsize=16, fontweight='bold')
+        
+                for ap in range(1, n_aps + 1):
+                    ax = axs_flat[ap - 1]
+                    
+                    x = frame_data[f'x_{ap}'].values[0] / self.binning
+                    y = frame_data[f'y_{ap}'].values[0] / self.binning
+                    fwhm = frame_data[f'fwhm_{ap}'].values[0] / self.binning
+                    flag = frame_data[f'flag_{ap}'].values[0]
+
+                    ax.imshow(data, cmap='gray_r', vmin=vmin, vmax=vmax, origin='lower')
+                    
+                    if pd.notna(x) and pd.notna(y):
+                        color = 'lime' if flag == 0 else 'red'
+                        plot_radius = fwhm if (pd.notna(fwhm) and fwhm > 0) else 5.0
+                        
+                        circle = patches.Circle((x, y), plot_radius * 1.8, edgecolor=color, 
+                                                facecolor='none', lw=1.5, alpha=0.8)
+                        ax.add_patch(circle)
+                        
+                        ax.set_xlim(x - zoom_box, x + zoom_box)
+                        ax.set_ylim(y - zoom_box, y + zoom_box)
+                        ax.set_title(f"Star {ap} (Flag: {flag})", fontsize=10, color=color)
+                        
+                        divider = make_axes_locatable(ax)
+                        ax_histx = divider.append_axes("top", size="25%", pad=0.05, sharex=ax)
+                        ax_histy = divider.append_axes("right", size="25%", pad=0.05, sharey=ax)
+                        
+                        x_start = max(0, int(x - zoom_box))
+                        x_end = min(data.shape[1], int(x + zoom_box))
+                        y_start = max(0, int(y - zoom_box))
+                        y_end = min(data.shape[0], int(y + zoom_box))
+                        cutout = data[y_start:y_end, x_start:x_end]
+                        
+                        if cutout.size > 0:
+                            local_median = np.nanmedian(cutout)
+                            
+                            cutout_subbed = cutout - local_median
+                            
+                            x_range = np.arange(x_start, x_end)
+                            y_range = np.arange(y_start, y_end)
+                            
+                            profile_x = np.nanmean(cutout_subbed, axis=0)
+                            profile_y = np.nanmean(cutout_subbed, axis=1)
+                            
+                            ax_histx.plot(x_range, profile_x, color='blue', lw=1.2, drawstyle='steps-mid')
+                            ax_histy.plot(profile_y, y_range, color='blue', lw=1.2, drawstyle='steps-mid')
+                            
+                            ax_histx.fill_between(x_range, profile_x, 0, step='mid', alpha=0.3, color='blue')
+                            ax_histy.fill_betweenx(y_range, 0, profile_y, step='mid', alpha=0.3, color='blue')
+
+                            ax_histx.axhline(0, color='black', lw=0.5, linestyle='--')
+                            ax_histy.axvline(0, color='black', lw=0.5, linestyle='--')
+                            ax_histx.set_yscale('symlog', linthresh=100.0)
+                            ax_histy.set_xscale('symlog', linthresh=100.0)
+                      
+                        ax_histx.axis('off')
+                        ax_histy.axis('off')
+                        # ==========================================
+                        # ==========================================
+
+                    else:
+                        ax.set_title(f"Star {ap} (Not Found)", fontsize=10, color='red')
+                
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                    for spine in ax.spines.values():
+                        spine.set_color(color if pd.notna(x) else 'red')
+                        spine.set_linewidth(2)
+
+
+                for j in range(n_aps, len(axs_flat)):
+                    axs_flat[j].axis('off')
+                
+                # Use subplots_adjust to manually set margins instead of tight_layout
+                plt.subplots_adjust(top=0.92, bottom=0.05, left=0.05, right=0.95)
+                
+                
+                save_file = os.path.join(zoom_dir, f'zoom_F{i+1}_{frame_name}.png')
+                plt.savefig(save_file, dpi=150, bbox_inches='tight')
+                plt.show() 
+                plt.close(fig)
+
+            except Exception as e:
+                print(f"{RED}Error plotting frame {i}: {e}{RESET}")
+
+
+    # ------------------------------------------------------------------
+    def plot_with_log(self, log_filename, ccd_num='1'):
+        df_log, n_aps = read_hipercam_log(log_filename)
+        df_log.to_csv(os.path.join(self.bias_dir, 'all.csv'))
+        print(f'[Plot Check Tracking] Save {os.path.join(self.bias_dir, 'all.csv')}')
+        
+        if df_log is None:
+            print(f"{RED}Error: Cannot read log file.{RESET}"); return
+
+        lis_file = self.lis[0] if self.lis else None
+        if not lis_file or not os.path.exists(lis_file):
+            print(f"{RED}Error: List file not found!{RESET}"); return
+
+        with open(lis_file, 'r') as f:
+            hcm_files = [line.strip() for line in f.readlines() if line.strip()]
+
+        ntot = len(hcm_files)
+        n_plot = ntot
+        print(f"{BLUE}--- Plotting {n_plot} frames ---{RESET}")
+        
+        ncols = 5
+        nrows = math.ceil(n_plot / ncols)
+        fig, axs = plt.subplots(nrows, ncols, figsize=(5*ncols, 5*nrows), facecolor='whitesmoke')
+        axs_flat = np.atleast_1d(axs).flatten()
+        zscale = ZScaleInterval()
+
+        for i in range(n_plot):
+            file_path = hcm_files[i]
+            ax = axs_flat[i]
+                  
+            try:
+                mccd = hcam.MCCD.read(file_path)         
+                data = mccd[ccd_num]['1'].data
+                vmin, vmax = zscale.get_limits(data)
+                ax.imshow(data, cmap='gray_r', vmin=vmin, vmax=vmax, origin='lower')
+                
+                # Use iloc to get data for the current frame
+                if i < len(df_log):
+                    frame_data = df_log.iloc[[i]]
+
+                    if not frame_data.empty:
+                        for ap in range(1, n_aps + 1):
+                            x = frame_data[f'x_{ap}'].values[0]/self.binning
+                            y = frame_data[f'y_{ap}'].values[0]/self.binning
+                            # fwhm = frame_data[f'fwhm_{ap}'].values[0]/self.binning
+                            fwhm = frame_data[f'mfwhm'].values[0]/self.binning
+                            flag = frame_data[f'flag_{ap}'].values[0]
+                       
+                            color = 'lime' if flag == 0 else 'red'
+                            plot_radius = fwhm  #if (pd.notna(fwhm) and fwhm > 0) else 5.0
+                            
+                            # info_text = f"Ap{ap}\n({x}, {y})\nF:{fwhm}"
+                            info_text = f"{ap}"
+                            if pd.notna(x) and pd.notna(y):
+                                circle = patches.Circle((x, y), plot_radius*1.8, edgecolor=color, 
+                                                       facecolor='none', lw=.5, alpha=0.8)
+                                ax.add_patch(circle)
+                                ax.text(x +1.5*plot_radius, y , info_text, color=color, fontsize=5, ha='center')
+
+                ax.set_title(f"F{i+1}: {os.path.basename(file_path)}", fontsize=8)
+                ax.axis('off')
+
+            except Exception as e:
+                ax.axis('off')
+                print(f"Error plotting frame {i}: {e}")
+
+        for j in range(n_plot, len(axs_flat)): axs_flat[j].axis('off')
+        
+        plt.tight_layout()
+        save_file = os.path.join(self.base_dir, f'reduction_check_{ccd_num}.png')
+        plt.savefig(save_file, dpi=150, bbox_inches='tight')
+        plt.show()
+        plt.close(fig)
