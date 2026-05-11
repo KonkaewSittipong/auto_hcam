@@ -589,20 +589,20 @@ class Photometry:
                     self.data['hcam_file'].append(hcm_files)
                     
     def setaper(self, ccd_label='1', win_label='1', SIGMA_THRESHOLD=3, SKIP_BRIGHTEST=10,
-                MARGIN_LEFT=15, MARGIN_RIGHT=15, MARGIN_BOTTOM=5, MARGIN_TOP=27,
-                R_TARG=None, R_SKY1=16, R_SKY2=24, frame=2, SATURATION=60000, diagnostics=False):
+                MARGIN_LEFT=15, MARGIN_RIGHT=15, MARGIN_BOTTOM=5, MARGIN_TOP=27, ref_index=1,
+                R_TARG=None, R_SKY1=16, R_SKY2=24, frame=2, SATURATION=50000, diagnostics=False):
         """
         Detect stars and write a HiPERCAM aperture (.ape) file.
         """
 
         for hcm_files in self.data['hcam_file']:
             self._detect_and_write_ape(
-                hcm_files[frame], ccd_label, win_label,
+                hcm_files[frame], ccd_label, win_label, ref_index,
                 SIGMA_THRESHOLD, SKIP_BRIGHTEST,
                 MARGIN_LEFT, MARGIN_RIGHT, MARGIN_BOTTOM, MARGIN_TOP,
                 R_TARG, R_SKY1, R_SKY2, SATURATION, diagnostics)
 
-    def _detect_and_write_ape(self, target_file, ccd_label, win_label,
+    def _detect_and_write_ape(self, target_file, ccd_label, win_label, ref_index,
                                SIGMA_THRESHOLD, SKIP_BRIGHTEST,
                                MARGIN_LEFT, MARGIN_RIGHT, MARGIN_BOTTOM, MARGIN_TOP,
                                R_TARG, R_SKY1, R_SKY2, SATURATION, diagnostics):
@@ -667,12 +667,18 @@ class Photometry:
  
         self.num_aps = len(sources)
 
+        # ref_index is 1-based; clamp then convert to 0-based
+        ref_idx    = max(1, min(ref_index, len(sources))) - 1
+        ref_ap_num = str(ref_idx + 1)
+        print(f" Reference aperture: {ref_ap_num} "
+              f"(brightness rank {ref_idx + 1 + SKIP_BRIGHTEST} overall)")
+
         # 5. Build the Aperture list
         ccd_ape = []
         for i, source in enumerate(sources):
             x, y, fwhm = source['xcentroid'], source['ycentroid'], source['fwhm']
             r_t = (R_TARG if R_TARG is not None else fwhm) * binning
-            
+            is_ref = (i == ref_idx)
             ccd_ape.append([str(i + 1), {
                 "Comment": "hipercam.Aperture",
                 "x": float(x) * binning,
@@ -680,11 +686,11 @@ class Photometry:
                 "rtarg": r_t,
                 "rsky1": R_SKY1 * binning,
                 "rsky2": R_SKY2 * binning,
-                "ref": (i == 0), # Brightest remaining star becomes the reference
+                "ref": is_ref,
                 "compo": False,
                 "mask": [],
                 "extra": [],
-                "link": "" if i == 0 else "1", # Link all others to the reference
+                "link": "" if is_ref else ref_ap_num,
             }])
 
         # Write to JSON .ape file
@@ -718,17 +724,26 @@ class Photometry:
     
             # Draw Apertures
             for i, source in enumerate(sources):
-                x, y = source['xcentroid']-llx, source['ycentroid']-lly
+                x, y = source['xcentroid'], source['ycentroid']   # window-pixel coords
                 ap_number = i + 1
+                is_ref_ap = (i == ref_idx)
                 r_plot = (R_TARG if R_TARG is not None else source['fwhm'])
-                
-                # Target Aperture
-                ax.add_patch(patches.Circle((x, y), r_plot, edgecolor='lime', facecolor='none', lw=1.5))
-                # Sky Annulus Inner
-                # ax.add_patch(patches.Circle((x, y), R_SKY1, edgecolor='red', facecolor='none', lw=1, linestyle='--'))
-                # # Sky Annulus Outer
-                # ax.add_patch(patches.Circle((x, y), R_SKY2, edgecolor='red', facecolor='none', lw=1, linestyle='--'))
-                ax.text(x, y + R_SKY2 + 2, str(ap_number), color='cyan', fontsize=12, fontweight='bold', ha='center', va='bottom')
+                edge_color = 'red' if is_ref_ap else 'lime'
+                lw = 2.5 if is_ref_ap else 1.5
+
+                ax.add_patch(patches.Circle((x, y), r_plot,
+                                            edgecolor=edge_color, facecolor='none', lw=lw))
+                ax.add_patch(patches.Circle((x, y), R_SKY1,
+                                            edgecolor='orange', facecolor='none',
+                                            lw=1.0, linestyle='--', alpha=0.7))
+                ax.add_patch(patches.Circle((x, y), R_SKY2,
+                                            edgecolor='deepskyblue', facecolor='none',
+                                            lw=1.0, linestyle='--', alpha=0.7))
+                label = f"[REF]{ap_number}" if is_ref_ap else str(ap_number)
+                ax.text(x, y + R_SKY2 + 2, label,
+                        color='red' if is_ref_ap else 'cyan',
+                        fontsize=10 if is_ref_ap else 8,
+                        fontweight='bold', ha='center', va='bottom')
             plt.title(f"Apertures on {os.path.basename(target_file)}", fontsize=14)
             plt.axis('off')
             plt.tight_layout()
@@ -917,23 +932,24 @@ class Photometry:
                                         gridspec_kw={'wspace': 0.4, 'hspace': 0.4}, facecolor='whitesmoke')
                 axs_flat = np.atleast_1d(axs).flatten()
 
+                _bin = getattr(self, 'binning', 1)
                 _E = R_EXTARCT if R_EXTARCT is not None else [1.8, 3.0, 15.0, 2.5, 15.0, 18.0, 3.0, 18.0, 20.0]
                 mfwhm_unbinned = frame_data['mfwhm'].values[0]
                 def _r(scale, rmin, rmax):
-                    return float(np.clip(scale * mfwhm_unbinned, rmin, rmax)) / self.binning if pd.notna(mfwhm_unbinned) else 5.0
+                    return float(np.clip(scale * mfwhm_unbinned, rmin, rmax)) / _bin if pd.notna(mfwhm_unbinned) else 5.0
                 r_targ = _r(_E[0], _E[1], _E[2])
                 r_sky1 = _r(_E[3], _E[4], _E[5])
                 r_sky2 = _r(_E[6], _E[7], _E[8])
                 fig.suptitle(
                     f"Frame {i+1}: {frame_name} | "
-                    f"rtarg={r_targ*self.binning:.2f} rsky1={r_sky1*self.binning:.2f} rsky2={r_sky2*self.binning:.2f} (unbin)",
+                    f"rtarg={r_targ*_bin:.2f} rsky1={r_sky1*_bin:.2f} rsky2={r_sky2*_bin:.2f} (unbin)",
                     fontsize=14, fontweight='bold')
 
                 for ap in range(1, n_aps + 1):
                     ax = axs_flat[ap - 1]
 
-                    x = (frame_data[f'x_{ap}'].values[0] - llx) / self.binning
-                    y = (frame_data[f'y_{ap}'].values[0] - lly) / self.binning
+                    x = (frame_data[f'x_{ap}'].values[0] - llx) / _bin
+                    y = (frame_data[f'y_{ap}'].values[0] - lly) / _bin
                     flag = frame_data[f'flag_{ap}'].values[0]
 
                     ax.imshow(data, cmap='gray_r', vmin=vmin, vmax=vmax, origin='lower')
@@ -1048,11 +1064,12 @@ class Photometry:
 
                 if i < len(df_log):
                     frame_data = df_log.iloc[[i]]
+                    _bin = getattr(self, 'binning', 1)
                     if not frame_data.empty:
                         for ap in range(1, n_aps + 1):
-                            x = (frame_data[f'x_{ap}'].values[0] - llx) / self.binning
-                            y = (frame_data[f'y_{ap}'].values[0] - lly) / self.binning
-                            fwhm = frame_data['mfwhm'].values[0] / self.binning
+                            x = (frame_data[f'x_{ap}'].values[0] - llx) / _bin
+                            y = (frame_data[f'y_{ap}'].values[0] - lly) / _bin
+                            fwhm = frame_data['mfwhm'].values[0] / _bin
                             flag = frame_data[f'flag_{ap}'].values[0]
 
                             color = 'lime' if flag == 0 else 'red'
