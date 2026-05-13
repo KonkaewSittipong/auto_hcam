@@ -507,9 +507,15 @@ class Ensemble():
         for col in mag_cols:
             star_id = col.split('_')[-1]
             err_col = f'instrue_{star_id}'
-            new_cols[f'mag_{star_id}'] = self.df_keep[col] - exp_corr
+            new_cols[f'mag_{star_id}']  = self.df_keep[col] - exp_corr
             if err_col in self.df_keep.columns:
                 new_cols[f'emag_{star_id}'] = self.df_keep[err_col]
+            # Append median RA/DEC for this aperture if WCS was solved
+            ra_col  = f'ra_{star_id}'
+            dec_col = f'dec_{star_id}'
+            if ra_col in self.df_keep.columns:
+                new_cols[f'RA_{star_id}']  = self.df_keep[ra_col]
+                new_cols[f'DEC_{star_id}'] = self.df_keep[dec_col]
         df_out = pd.concat(
             [df_out, pd.DataFrame(new_cols, index=self.df_keep.index)], axis=1
         )

@@ -321,6 +321,7 @@ def process_single_run(run_config):
                 scale_high=config.SCALE_HIGH,
                 single_frame=config.SINGLE_FRAME,
                 astrometry_cache=config.ASTROMETRY_CACHE,
+                ignor_stars=config.IGNOR_STARS
             )
             return f"[{run_name}] Success: Run completed."
         else:
